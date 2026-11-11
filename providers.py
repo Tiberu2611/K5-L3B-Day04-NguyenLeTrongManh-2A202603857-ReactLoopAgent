@@ -1,6 +1,7 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 
@@ -12,16 +13,65 @@ CONFIG = {
 }
 
 
-def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
+def endpoint_url(name, base):
+    """Đổi base URL của dịch vụ trung gian thành endpoint đầy đủ.
+
+    OpenAI-compatible: base thường gồm /v1, ví dụ https://gateway.example/v1 -> .../v1/chat/completions.
+    Anthropic-compatible: https://gateway.example hoặc .../v1 -> .../v1/messages.
+    """
+    base = base.strip().rstrip('/')
+    if not base.startswith(('https://', 'http://')):
+        raise ValueError(f'{name.upper()}_BASE_URL phải bắt đầu bằng https:// hoặc http://')
+    suffix = '/messages' if name == 'anthropic' else '/chat/completions'
+    if base.endswith(suffix):
+        return base
+    if name == 'anthropic' and not base.endswith('/v1'):
+        base += '/v1'
+    return base + suffix
+
+
+RETRY_STATUS = {429, 500, 502, 503, 504}   # lỗi tạm thời của provider/gateway
+MAX_ATTEMPTS = 3
+MAX_RETRY_WAIT = 30
+DEFAULT_TIMEOUT = 180   # giây; model có reasoning (nhất là judge) có thể trả lời > 60s
+
+
+def request_timeout():
+    """Thời gian chờ mỗi request, chỉnh bằng PROVIDER_TIMEOUT (giây)."""
     try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+        value = float(os.getenv('PROVIDER_TIMEOUT', DEFAULT_TIMEOUT))
+    except ValueError:
+        return DEFAULT_TIMEOUT
+    return value if value > 0 else DEFAULT_TIMEOUT
+
+
+def _retry_delay(exc, attempt):
+    """Chờ theo Retry-After nếu hợp lệ, nếu không thì backoff 2s, 4s, ..."""
+    retry_after = exc.headers.get('Retry-After') if getattr(exc, 'headers', None) else None
+    try:
+        return min(float(retry_after), MAX_RETRY_WAIT)
+    except (TypeError, ValueError):
+        return 2 ** attempt
+
+
+def post_json(url, headers, payload):
+    data = json.dumps(payload).encode()
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json', **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=request_timeout()) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code in RETRY_STATUS and attempt < MAX_ATTEMPTS:
+                time.sleep(_retry_delay(exc, attempt))
+                continue
+            # Do not print response bodies: they may contain account or request data.
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(2 ** attempt)
+                continue
+            raise RuntimeError(f'Không kết nối được provider: {getattr(exc, "reason", exc)}') from exc
 
 
 class Provider:
@@ -30,13 +80,18 @@ class Provider:
     messages: system/user/assistant/tool theo format Chat Completions. message trả về
     cần được append nguyên vẹn; tool result có role, tool_call_id, content (JSON string).
     """
-    def __init__(self, name, model):
+    def __init__(self, name, model, base_url=None):
         if name not in CONFIG:
             raise ValueError(f'Provider không hợp lệ: {name}')
         if not model:
             raise ValueError('Cần đặt MODEL là model có hỗ trợ tool calling.')
         self.name, self.model = name, model
         key_name, self.url = CONFIG[name]
+        # Dịch vụ trung gian: truyền base_url (hoặc --base-url), nếu không thì đọc <PROVIDER>_BASE_URL,
+        # ví dụ OPENAI_BASE_URL=https://gateway.example/v1. Không có cả hai thì dùng URL mặc định.
+        base = base_url or os.getenv(f'{name.upper()}_BASE_URL')
+        if base:
+            self.url = endpoint_url(name, base)
         self.key = os.getenv(key_name)
         if not self.key:
             raise ValueError(f'Thiếu {key_name}; xem README.md.')

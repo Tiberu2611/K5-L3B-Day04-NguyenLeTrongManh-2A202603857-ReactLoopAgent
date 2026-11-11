@@ -15,14 +15,14 @@ from bonus.tools import BonusTools
 
 def run_case(case, args):
     try:
-        result = run_agent(case['question'], Provider(args.provider, args.model),
+        result = run_agent(case['question'], Provider(args.provider, args.model, base_url=getattr(args, 'base_url', None)),
                            (BonusTools('snapshot', scenario=case.get('scenario', 'normal')) if getattr(args, 'bonus', False) else ScenarioTools(case.get('scenario', 'normal'), case.get('fail', False))), max_steps=args.max_steps)
     except Exception as exc:
         result = {'status': 'error', 'answer': '', 'trace': [], 'usage': [], 'error': f'{type(exc).__name__}: {str(exc)[:200]}'}
     if not isinstance(result, dict) or not isinstance(result.get('trace', []), list):
         result = {'status': 'error', 'answer': '', 'trace': [], 'usage': [], 'error': 'run_agent trả kết quả không hợp lệ.'}
     try:
-        judge = Provider(args.judge_provider, args.judge_model)
+        judge = Provider(args.judge_provider, args.judge_model, base_url=getattr(args, 'judge_base_url', None))
         grade = grade_case(case, result, judge)
     except Exception as exc:
         grade = {'score': None, 'status': 'unscored', 'reason': str(exc), 'judge_usage': {}}
@@ -38,6 +38,8 @@ def main():
     parser.add_argument('--model', default=os.getenv('MODEL'))
     parser.add_argument('--judge-provider', choices=choices, default=os.getenv('JUDGE_PROVIDER'))
     parser.add_argument('--judge-model', default=os.getenv('JUDGE_MODEL'))
+    parser.add_argument('--base-url', default=None, help='Base URL dịch vụ trung gian cho agent, ví dụ https://gateway.example/v1')
+    parser.add_argument('--judge-base-url', default=None, help='Base URL cho judge; mặc định dùng --base-url nếu judge cùng provider')
     parser.add_argument('--bonus', action='store_true', help='Chạy bộ bonus riêng; không ảnh hưởng điểm chính')
     parser.add_argument('--case', help='Ví dụ E2 hoặc H1; bỏ trống để chạy toàn bộ')
     parser.add_argument('--max-steps', type=int, default=None, help='Giới hạn model calls mỗi case: mặc định 8, bonus 16')
@@ -46,6 +48,8 @@ def main():
     args = parser.parse_args()
     args.judge_provider = args.judge_provider or args.provider
     args.judge_model = args.judge_model or args.model
+    if not args.judge_base_url and args.judge_provider == args.provider:
+        args.judge_base_url = args.base_url
     if not args.model or not args.judge_model:
         parser.error('Thiếu --model hoặc MODEL')
     args.max_steps = args.max_steps if args.max_steps is not None else (16 if args.bonus else 8)
